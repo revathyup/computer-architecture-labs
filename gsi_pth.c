@@ -1,218 +1,151 @@
-/**
- * Gauss-Seidel implementation using pthreads.
- *
- *
- * Course: Advanced Computer Architecture, Uppsala University
- * Course Part: Lab assignment 3
- *
- * Original author: Frédéric Haziza <daz@it.uu.se>
- * Heavily modified by: Andreas Sandberg <andreas.sandberg@it.uu.se>
- *
- */
-
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdatomic.h>
 
 #include "gs_interface.h"
 
-/**
- * Tell the startup code that we want run in parallel mode.
- */
 const int gsi_is_parallel = 1;
 
-/**
- * Thread data structure passed to the thread entry function.
- */
 typedef struct {
-        int thread_id;
-        pthread_t thread;
-
-        double error;
-
-        /* TASK: Do you need any thread local state for synchronization? */
+    int thread_id;
+    pthread_t thread;
+    double error;
+    char padding[64 - sizeof(int) - sizeof(pthread_t) - sizeof(double)]; // Padding to prevent false sharing
 } thread_info_t;
 
-/** Define to enable debug mode */
-#define DEBUG 0 /* 1 */
+#define DEBUG 0
+#define dprintf(...) if (DEBUG) fprintf(stderr, __VA_ARGS__)
 
-/** Debug output macro. Only active when DEBUG is non-0 */
-#define dprintf(...)                            \
-        if (DEBUG)                              \
-                fprintf(stderr, __VA_ARGS__)
-
-/** Vector with information about all active threads */
 thread_info_t *threads = NULL;
-
-/** The global error for the last iteration */
 static double global_error;
 
+// Synchronization variables
+static _Atomic int *progress_counter;
+static pthread_barrier_t iter_barrier;
 
-
-void
-gsi_init()
+void gsi_init()
 {
-        gs_verbose_printf("\t****  Initializing the  environment ****\n");
+    gs_verbose_printf("\t**** Initializing environment ****\n");
 
-        threads = (thread_info_t *)malloc(gs_nthreads * sizeof(thread_info_t));
-        if (!threads) {
-                fprintf(stderr,
-                        "Failed to allocate memory for thread information.\n");
-                exit(EXIT_FAILURE);
-        }
+    threads = (thread_info_t *)malloc(gs_nthreads * sizeof(thread_info_t));
+    if (!threads) {
+        fprintf(stderr, "Failed to allocate thread information.\n");
+        exit(EXIT_FAILURE);
+    }
 
-        /* Initialize global_error to something larger than the
-         * tolerance to get the algorithm started */
-        global_error = gs_tolerance + 1;
+    global_error = gs_tolerance + 1;  // Ensure we start with error > tolerance
 
-        /* TASK: Initialize global variables here */
+    // Initialize progress counter
+    progress_counter = (_Atomic int *)malloc(gs_size * sizeof(_Atomic int));
+    if (!progress_counter) {
+        fprintf(stderr, "Failed to allocate progress counter.\n");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < gs_size; i++)
+        atomic_init(&progress_counter[i], -1);
+
+    pthread_barrier_init(&iter_barrier, NULL, gs_nthreads);
 }
 
-void
-gsi_finish()
+void gsi_finish()
 {
-        gs_verbose_printf("\t****  Cleaning environment ****\n");
+    gs_verbose_printf("\t**** Cleaning environment ****\n");
 
-        /* TASK: Be nice and cleanup the stuff you initialized in
-         * gsi_init()
-         */
-
-        if (threads)
-                free(threads);
+    free(progress_counter);
+    pthread_barrier_destroy(&iter_barrier);
+    free(threads);
 }
 
-static void
-thread_sweep(int tid, int iter, int lbound, int rbound)
+static void thread_sweep(int tid, int iter, int lbound, int rbound)
 {
-        threads[tid].error = 0.0;
+    threads[tid].error = 0.0;
 
-        for (int row = 1; row < gs_size - 1; row++) {
-                dprintf("%d: checking wait condition\n"
-                        "\titeration: %i, row: %i\n",
-                        tid,
-                        iter, row);
-
-                /* TASK: Wait for data to be available from the thread
-                 * to the left */
-
-                dprintf("%d: Starting on row: %d\n", tid, row);
-
-                /* Update this thread's part of the matrix */
-                for (int col = lbound; col < rbound; col++) {
-                        double new_value = 0.25 * (
-                                gs_matrix[GS_INDEX(row + 1, col)] +
-                                gs_matrix[GS_INDEX(row - 1, col)] +
-                                gs_matrix[GS_INDEX(row, col + 1)] +
-                                gs_matrix[GS_INDEX(row, col - 1)]);
-                        threads[tid].error +=
-                                fabs(gs_matrix[GS_INDEX(row, col)] - new_value);
-                        gs_matrix[GS_INDEX(row, col)] = new_value;
-                }
-
-                /* TASK: Tell the thread to the right that this thread
-                 * is done with the row */
-
-                dprintf("%d: row %d done\n", tid, row);
+    for (int row = 1; row < gs_size - 1; row++) {
+        // Wait for previous row to complete in this iteration
+        if (row > 1) {
+            while (atomic_load(&progress_counter[row-1]) < iter) {
+                // Brief pause to reduce contention
+                for (volatile int i = 0; i < 100; i++);
+            }
         }
 
+        // Process current row
+        for (int col = lbound; col < rbound; col++) {
+            double new_value = 0.25 * (
+                gs_matrix[GS_INDEX(row + 1, col)] +
+                gs_matrix[GS_INDEX(row - 1, col)] +
+                gs_matrix[GS_INDEX(row, col + 1)] +
+                gs_matrix[GS_INDEX(row, col - 1)]);
+            threads[tid].error += fabs(gs_matrix[GS_INDEX(row, col)] - new_value);
+            gs_matrix[GS_INDEX(row, col)] = new_value;
+        }
+
+        // Mark row as complete for this iteration
+        atomic_store(&progress_counter[row], iter);
+    }
 }
 
-/**
- * Computing routine for each thread
- */
-static void *
-thread_compute(void *_self)
+static void *thread_compute(void *_self)
 {
-        thread_info_t *self = (thread_info_t *)_self;
-        const int tid = self->thread_id;
+    thread_info_t *self = (thread_info_t *)_self;
+    const int tid = self->thread_id;
 
-        int lbound = 0, rbound = 0;
+    // Calculate column bounds for this thread
+    const int chunk_size = (gs_size - 2 + gs_nthreads - 1) / gs_nthreads;
+    const int lbound = 1 + tid * chunk_size;
+    const int rbound = (tid == gs_nthreads - 1) ? gs_size - 1 : lbound + chunk_size;
 
-        /* TASK: Compute bounds for this thread */
+    for (int iter = 0; iter < gs_iterations && global_error > gs_tolerance; iter++) {
+        thread_sweep(tid, iter, lbound, rbound);
 
-        gs_verbose_printf("%i: lbound: %i, rbound: %i\n",
-                          tid, lbound, rbound);
+        // Barrier: Wait for all threads to finish sweep
+        pthread_barrier_wait(&iter_barrier);
 
-        for (int iter = 0;
-             iter < gs_iterations && global_error > gs_tolerance;
-             iter++) {
-                dprintf("%i: Starting iteration %i\n", tid, iter);
-
-                thread_sweep(tid, iter, lbound, rbound);
-
-                /* TASK: Update global error */
-                /* Note: The reduction should only be done by one
-                 * thread after all threads have updated their local
-                 * errors */
-                /* Hint: Which thread is guaranteed to complete its
-                 * sweep last? */
-
-                dprintf("%d: iteration %d done\n", tid, iter);
-
-                /* TASK: Iteration barrier */
+        // Thread 0 computes global error
+        if (tid == 0) {
+            global_error = 0.0;
+            for (int t = 0; t < gs_nthreads; t++) {
+                global_error += threads[t].error;
+            }
         }
 
-        gs_verbose_printf(
-                "\t****  Thread %d done after %d iterations ****\n",
-                tid, gs_iterations);
+        // Barrier: Wait for global error to be updated
+        pthread_barrier_wait(&iter_barrier);
+    }
 
-        return NULL;
+    return NULL;
 }
 
-/**
- * Parallel implementation of the GS algorithm. Called from
- * gs_common.c to start the solver.
- */
-void
-gsi_calculate()
+void gsi_calculate()
 {
-        int err;
+    // Initialize all thread errors to 0
+    for (int t = 0; t < gs_nthreads; t++) {
+        threads[t].thread_id = t;
+        threads[t].error = 0.0;
+    }
 
-        for (int t = 0; t < gs_nthreads; t++) {
-                gs_verbose_printf("\tSpawning thread %d\n",t);
+    // Create threads
+    for (int t = 0; t < gs_nthreads; t++) {
+        if (pthread_create(&threads[t].thread, NULL, thread_compute, &threads[t])) {
+            perror("pthread_create failed");
+            exit(EXIT_FAILURE);
+        }
+    }
 
-                threads[t].thread_id = t;
-                err = pthread_create(&threads[t].thread, NULL,
-                                     thread_compute, &threads[t]);
-                if (err) {
-                        fprintf(stderr,
-                                "Error: pthread_create() failed: %d, "
-                                "thread %d\n",
-                                err, t);
-                        exit(EXIT_FAILURE);
-                }
+    // Join threads
+    for (int t = 0; t < gs_nthreads; t++) {
+        if (pthread_join(threads[t].thread, NULL)) {
+            perror("pthread_join failed");
+            exit(EXIT_FAILURE);
         }
-  
-        /* Calling pthread_join on a thread will block until the
-         * thread terminates. Since we are joining all threads, we
-         * wait until all threads have exited. */
-        for (int t = 0; t < gs_nthreads; t++) {
-                err = pthread_join(threads[t].thread, NULL);
-                if (err) {
-                        fprintf(stderr,
-                                "Error: pthread_join() failed: %d, "
-                                "thread %d\n",
-                                err, t);
-                        exit(EXIT_FAILURE);
-                }
-        }
+    }
 
-        if (global_error <= gs_tolerance) {
-                printf("Solution converged!\n");
-        } else {
-                printf("Reached maximum number of iterations. Solution did "
-                       "NOT converge.\n");
-                printf("Note: This is normal if you are using the "
-                       "default settings.\n");
-        }
+    if (global_error <= gs_tolerance) {
+        printf("Solution converged!\n");
+    } else {
+        printf("Reached maximum number of iterations. Solution did NOT converge.\n");
+        printf("Note: This is normal if you are using the default settings.\n");
+    }
 }
-
-/*
- * Local Variables:
- * mode: c
- * c-basic-offset: 8
- * indent-tabs-mode: nil
- * c-file-style: "linux"
- * End:
- */
