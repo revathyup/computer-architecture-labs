@@ -76,7 +76,7 @@
   */
  void gsi_finish() {
      gs_verbose_printf("\t****  Cleaning parallel environment ****\n");
-     
+     /* 10> destroyed or cleaned*/
      pthread_barrier_destroy(&iter_barrier);
      free(threads);
  }
@@ -91,7 +91,7 @@
      
      /* We're iterating over interior points only, so we start at row 1 and end at (gs_size-2) */
      for (int i = 1; i < gs_size - 1; i++) {
-         /* Wait for the thread to the left to finish this row before we start */
+         /*  11> Wait for the thread to the left to finish this row before we start */
          if (tid > 0) {
              while (atomic_load(&threads[tid - 1].row_progress) < i) {
                  /* Short busy wait to reduce contention */
@@ -112,11 +112,11 @@
              /* Calculate local error */
              local_error += fabs(gs_matrix[GS_INDEX(i, j)] - new_value);
              
-             /* Update the matrix in-place with the new value */
+             /* 11> Update the matrix in-place with the new value */
              gs_matrix[GS_INDEX(i, j)] = new_value;
          }
          
-         /* Signal that we've completed processing this row */
+         /* 12> Signal that we've completed processing this row */
          atomic_store(&threads[tid].row_progress, i);
      }
      
@@ -132,7 +132,7 @@
      thread_info_t *self = (thread_info_t *)_self;
      int tid = self->thread_id;
      
-     /* Calculate the column range for this thread */
+     /* 13> Calculate the column range for this thread */
      int interior_size = gs_size - 2;  /* number of interior points in each dimension */
      int points_per_thread = interior_size / gs_nthreads;
      int start_col = 1 + tid * points_per_thread;
@@ -142,19 +142,19 @@
      
      /* Main iteration loop */
      for (int iter = 0; iter < gs_iterations; iter++) {
-         /* Reset progress indicators before starting a new iteration */
+         /* 14> Reset progress indicators before starting a new iteration */
          atomic_store(&threads[tid].row_progress, 0);
          
-         /* Synchronize all threads before starting a new iteration */
+         /* 15> Synchronize all threads before starting a new iteration */
          pthread_barrier_wait(&iter_barrier);
          
          /* Process this thread's part of the matrix */
          thread_sweep(tid, start_col, end_col);
          
-         /* Wait for all threads to finish their sweep before accumulating errors */
+         /*16>  Wait for all threads to finish their sweep before accumulating errors */
          pthread_barrier_wait(&iter_barrier);
          
-         /* Thread 0 computes the global error and checks for convergence */
+         /*17> Thread 0 computes the global error and checks for convergence */
          if (tid == 0) {
              global_error = 0.0;
              for (int t = 0; t < gs_nthreads; t++) {
