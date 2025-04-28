@@ -1,0 +1,511 @@
+# Parallel Gauss-Seidel Implementation: Line-by-Line Explanation
+
+## Headers and Includes (Lines 1-14)
+
+```c
+/**
+ * Parallel Gauss-Seidel implementation using pthreads.
+ *
+ * Course: Advanced Computer Architecture, Uppsala University
+ * Course Part: Lab assignment 3
+ */
+
+#include <pthread.h>    // For pthread functions (thread creation, joining, barriers)
+#include <stdio.h>      // For standard I/O functions like printf
+#include <stdlib.h>     // For memory allocation functions
+#include <math.h>       // For mathematical functions like fabs (absolute value)
+#include <stdatomic.h>  // For atomic operations (thread-safe variables)
+
+#include "gs_interface.h" // Custom header defining the interface for our implementation
+```
+
+These are the necessary header files. The key ones are:
+- `pthread.h`: Provides the POSIX threads API for creating and managing threads
+- `stdatomic.h`: Provides atomic operations for thread-safe variables
+- `gs_interface.h`: Contains the interface definitions that our implementation must satisfy
+
+## Debug Printing Setup (Lines 16-23)
+
+```c
+/* Define this to enable debug printing */
+#define DEBUG 0
+
+#if DEBUG
+#define dprintf(...) gs_verbose_printf(__VA_ARGS__)
+#else
+#define dprintf(...) /* Don't print anything */
+#endif
+```
+
+This is a conditional compilation setup for debugging:
+- If `DEBUG` is set to 1, debugging messages will be printed
+- If `DEBUG` is set to 0, the debugging code will be completely removed by the compiler
+- `__VA_ARGS__` is a special macro that forwards all arguments to the function
+
+## Flag for Parallel Implementation (Line 25)
+
+```c
+const int gsi_is_parallel = 1;
+```
+
+This flag tells the framework that we're using a parallel implementation. It's required by the interface.
+
+## Thread Information Structure (Lines 27-39)
+
+```c
+/**
+ * Thread information structure
+ * Contains all the information needed by the worker threads
+ * Aligned to cache line size (64 bytes) to prevent false sharing
+ */
+typedef struct {
+    int thread_id;            /* Thread ID */
+    pthread_t thread;         /* pthread handle */
+    double error;             /* Local error accumulator for this thread */
+    _Atomic int row_progress; /* Progress counter for row synchronization */
+    /* Padding to avoid false sharing */
+    char padding[64];  
+} __attribute__((aligned(64))) thread_info_t;
+```
+
+This defines a structure to hold thread-specific information:
+- `thread_id`: A unique identifier for each thread (0, 1, 2, etc.)
+- `pthread_t thread`: The POSIX thread handle used for creating and joining threads
+- `double error`: Each thread calculates its own local error which will be combined later
+- `_Atomic int row_progress`: An atomic (thread-safe) counter indicating which row the thread is processing
+- `char padding[64]`: Extra bytes to ensure the structure takes up a full cache line
+- `__attribute__((aligned(64)))`: Ensures the structure is aligned to a 64-byte boundary (cache line size)
+
+The cache line alignment and padding are critical to prevent false sharing. False sharing happens when two threads modify variables that happen to be on the same cache line, causing unnecessary cache invalidations between CPU cores.
+
+## Global Variables (Lines 41-46)
+
+```c
+/* Global variables */
+static thread_info_t *threads = NULL;       // Array of thread information structures
+static double global_error;                 // Combined error across all threads
+static int converged = 0;                   // Flag indicating if solution has converged
+static pthread_barrier_t iter_barrier;      // Barrier for synchronizing between iterations
+static int iterations_completed = 0;        // Counter for completed iterations
+```
+
+These variables are shared between all threads:
+- `threads`: An array to store information for each thread
+- `global_error`: The sum of all threads' local errors
+- `converged`: A flag set to 1 when the solution has converged
+- `iter_barrier`: A synchronization barrier used to coordinate threads between iterations
+- `iterations_completed`: Tracks how many iterations have been completed
+
+## Initialization Function (Lines 48-76)
+
+```c
+/**
+ * Initialize the thread information structures and other shared data.
+ */
+void gsi_init() {
+    gs_verbose_printf("\t****  Initializing parallel environment ****\n");
+
+    /* Allocate thread info structs with cache line alignment to avoid false sharing */
+    threads = (thread_info_t *)aligned_alloc(64, gs_nthreads * sizeof(thread_info_t));
+    if (!threads) {
+        fprintf(stderr, "Failed to allocate thread info\n");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Initialize barrier for synchronization between iterations */
+    pthread_barrier_init(&iter_barrier, NULL, gs_nthreads);
+    
+    /* Initialize thread-specific data */
+    for (int i = 0; i < gs_nthreads; i++) {
+        threads[i].thread_id = i;
+        threads[i].error = 0.0;
+        atomic_init(&threads[i].row_progress, 0);
+    }
+    
+    global_error = gs_tolerance + 1;  /* Initial error value */
+    converged = 0;                    /* Convergence flag */
+    iterations_completed = 0;         /* Number of completed iterations */
+    
+    dprintf("\t****  Parallel environment initialized with %d threads ****\n", gs_nthreads);
+}
+```
+
+This function sets up everything before computation begins:
+- `aligned_alloc(64, ...)`: Allocates memory aligned to a 64-byte boundary for the thread array
+- `pthread_barrier_init`: Creates a barrier that will block until all threads reach it
+- The loop initializes each thread's data: ID, error value, and row progress counter
+- `atomic_init`: Safely initializes the atomic row progress counter to avoid race conditions
+- The global variables are initialized with starting values
+
+## Cleanup Function (Lines 78-86)
+
+```c
+/**
+ * Clean up the thread information structures and other shared data.
+ */
+void gsi_finish() {
+    gs_verbose_printf("\t****  Cleaning parallel environment ****\n");
+    
+    pthread_barrier_destroy(&iter_barrier);
+    free(threads);
+}
+```
+
+This function cleans up resources after computation completes:
+- `pthread_barrier_destroy`: Releases the barrier's resources
+- `free(threads)`: Releases the memory allocated for thread information
+
+## Thread Sweep Function (Lines 88-136)
+
+```c
+/**
+ * Performs a sweep of the Gauss-Seidel algorithm for a single thread.
+ * Each thread works on its own vertical chunk of the matrix, maintaining
+ * data dependencies across threads.
+ *
+ * @param tid Thread ID
+ * @param start_col Starting column for this thread's chunk (inclusive)
+ * @param end_col Ending column for this thread's chunk (exclusive)
+ * @return Local error accumulated by this thread
+ */
+static double thread_sweep(int tid, int start_col, int end_col) {
+    double local_error = 0.0;
+    
+    /* Process each row from top to bottom */
+    for (int i = 1; i < gs_size - 1; i++) {
+        /* Wait for the thread to the left to finish this row before starting */
+        if (tid > 0) {
+            /* Busy-wait until the left neighbor has processed this row */
+            while (atomic_load(&threads[tid - 1].row_progress) < i) {
+                /* Light busy wait to reduce contention */
+                for (volatile int k = 0; k < 10; k++);
+            }
+        }
+        
+        /* Process each column in our assigned range */
+        for (int j = start_col; j < end_col; j++) {
+            /* Calculate new value using the 5-point stencil
+             * Note that we're using the latest values available
+             * (Gauss-Seidel is inherently sequential) */
+            double new_value = 0.25 * (
+                gs_matrix[GS_INDEX(i + 1, j)] +  /* Below (old value) */
+                gs_matrix[GS_INDEX(i - 1, j)] +  /* Above (old value) */
+                gs_matrix[GS_INDEX(i, j + 1)] +  /* Right (old value) */
+                gs_matrix[GS_INDEX(i, j - 1)]    /* Left (new value if updated) */
+            );
+            
+            /* Accumulate the error for convergence check */
+            local_error += fabs(gs_matrix[GS_INDEX(i, j)] - new_value);
+            
+            /* Update the matrix in-place with the new value */
+            gs_matrix[GS_INDEX(i, j)] = new_value;
+        }
+        
+        /* Signal that we've completed processing this row */
+        atomic_store(&threads[tid].row_progress, i);
+    }
+    
+    return local_error;
+}
+```
+
+This is the core computation function that each thread executes:
+
+- `double local_error = 0.0`: Initializes a local error accumulator for this thread's work
+
+- **Row Loop**: `for (int i = 1; i < gs_size - 1; i++)`: Iterates through each interior row
+  
+- **Synchronization Block**:
+  ```c
+  if (tid > 0) {
+      while (atomic_load(&threads[tid - 1].row_progress) < i) {
+          for (volatile int k = 0; k < 10; k++);
+      }
+  }
+  ```
+  This is the key to maintaining the Gauss-Seidel order:
+  - If this is not the leftmost thread (tid > 0), wait for the thread to the left
+  - `atomic_load` safely reads the progress counter of the left neighbor
+  - The inner loop with `volatile` creates a small delay to reduce contention
+  - This busy-waiting continues until the left thread has processed this row
+
+- **Column Loop**: `for (int j = start_col; j < end_col; j++)`: Processes each column in this thread's assigned section
+
+- **Computation**:
+  ```c
+  double new_value = 0.25 * (
+      gs_matrix[GS_INDEX(i + 1, j)] +  /* Below (old value) */
+      gs_matrix[GS_INDEX(i - 1, j)] +  /* Above (old value) */
+      gs_matrix[GS_INDEX(i, j + 1)] +  /* Right (old value) */
+      gs_matrix[GS_INDEX(i, j - 1)]    /* Left (new value if updated) */
+  );
+  ```
+  This is the core Gauss-Seidel calculation:
+  - Creates the new value as the average of the 4 neighboring cells
+  - `GS_INDEX` is a macro to convert 2D coordinates to a 1D array index
+  - The comments indicate which values are guaranteed to be updated already
+
+- **Error Calculation**:
+  ```c
+  local_error += fabs(gs_matrix[GS_INDEX(i, j)] - new_value);
+  ```
+  - Accumulates the absolute difference between old and new values
+  - This measures how much the solution is changing
+
+- **Matrix Update**:
+  ```c
+  gs_matrix[GS_INDEX(i, j)] = new_value;
+  ```
+  - Updates the matrix in place with the new value
+
+- **Progress Update**:
+  ```c
+  atomic_store(&threads[tid].row_progress, i);
+  ```
+  - Atomically updates this thread's progress counter
+  - Signals to the thread on the right that this row is complete
+
+## Thread Computation Function (Lines 138-199)
+
+```c
+/**
+ * Main computation function for each thread.
+ * This function is executed by each worker thread.
+ */
+static void *thread_compute(void *arg) {
+    thread_info_t *self = (thread_info_t *)arg;
+    int tid = self->thread_id;
+    
+    /* Calculate column range for this thread
+     * We divide the interior points of the matrix evenly among threads */
+    int interior_cols = gs_size - 2;  /* Number of interior columns */
+    int cols_per_thread = interior_cols / gs_nthreads;
+    int start_col = 1 + tid * cols_per_thread;
+    int end_col;
+    
+    /* The last thread gets any remaining columns */
+    if (tid == gs_nthreads - 1)
+        end_col = gs_size - 1;
+    else
+        end_col = start_col + cols_per_thread;
+    
+    dprintf("Thread %d handling columns %d to %d\n", tid, start_col, end_col - 1);
+    
+    /* Main iteration loop */
+    for (int iter = 0; iter < gs_iterations && !converged; iter++) {
+        /* Reset progress counter for this iteration */
+        atomic_store(&self->row_progress, 0);
+        self->error = 0.0;
+        
+        /* Synchronize all threads before starting the iteration */
+        pthread_barrier_wait(&iter_barrier);
+        
+        /* Perform the Gauss-Seidel sweep for this thread's chunk */
+        self->error = thread_sweep(tid, start_col, end_col);
+        
+        /* Wait for all threads to finish their sweep */
+        pthread_barrier_wait(&iter_barrier);
+        
+        /* Thread 0 calculates the global error and checks convergence */
+        if (tid == 0) {
+            iterations_completed = iter + 1;
+            
+            /* Sum up the errors from all threads */
+            global_error = 0.0;
+            for (int t = 0; t < gs_nthreads; t++) {
+                global_error += threads[t].error;
+            }
+            
+            dprintf("Iteration: %d, Error: %f\n", iter, global_error);
+            
+            /* Check for convergence */
+            if (global_error <= gs_tolerance) {
+                converged = 1;
+            }
+        }
+        
+        /* Wait for error calculation before potentially starting the next iteration */
+        pthread_barrier_wait(&iter_barrier);
+    }
+    
+    return NULL;
+}
+```
+
+This function contains the main logic for each thread:
+
+- **Thread Setup**:
+  ```c
+  thread_info_t *self = (thread_info_t *)arg;
+  int tid = self->thread_id;
+  ```
+  - Casts the argument to the thread info structure
+  - Extracts the thread ID for convenience
+
+- **Work Division**:
+  ```c
+  int interior_cols = gs_size - 2;
+  int cols_per_thread = interior_cols / gs_nthreads;
+  int start_col = 1 + tid * cols_per_thread;
+  ```
+  - Calculates how many columns each thread should process
+  - Divides the inner columns evenly among threads
+  
+- **Column Range Handling**:
+  ```c
+  if (tid == gs_nthreads - 1)
+      end_col = gs_size - 1;
+  else
+      end_col = start_col + cols_per_thread;
+  ```
+  - Special case for the last thread to handle any remainder columns
+  - Ensures all columns are covered exactly once
+
+- **Main Iteration Loop**:
+  ```c
+  for (int iter = 0; iter < gs_iterations && !converged; iter++) {
+  ```
+  - Continues until maximum iterations are reached or convergence is detected
+
+- **Iteration Preparation**:
+  ```c
+  atomic_store(&self->row_progress, 0);
+  self->error = 0.0;
+  ```
+  - Resets the progress counter for this iteration
+  - Clears the local error accumulator
+
+- **First Barrier Synchronization**:
+  ```c
+  pthread_barrier_wait(&iter_barrier);
+  ```
+  - Ensures all threads have completed preparation before starting
+
+- **Thread Sweep**:
+  ```c
+  self->error = thread_sweep(tid, start_col, end_col);
+  ```
+  - Calls the sweep function we analyzed earlier
+  - Stores the returned local error in the thread info structure
+
+- **Second Barrier Synchronization**:
+  ```c
+  pthread_barrier_wait(&iter_barrier);
+  ```
+  - Ensures all threads have completed their sweeps before checking convergence
+
+- **Convergence Check** (only done by thread 0):
+  ```c
+  if (tid == 0) {
+      iterations_completed = iter + 1;
+      global_error = 0.0;
+      for (int t = 0; t < gs_nthreads; t++) {
+          global_error += threads[t].error;
+      }
+      if (global_error <= gs_tolerance) {
+          converged = 1;
+      }
+  }
+  ```
+  - Updates the iteration counter
+  - Sums the local errors from all threads
+  - Checks if the global error is below the tolerance
+  - Sets the convergence flag if criteria are met
+
+- **Third Barrier Synchronization**:
+  ```c
+  pthread_barrier_wait(&iter_barrier);
+  ```
+  - Ensures all threads see the updated convergence flag before the next iteration
+
+## Main Calculation Function (Lines 201-230)
+
+```c
+/**
+ * Main entry point for the Gauss-Seidel calculation.
+ * Creates threads, starts the calculation, and waits for threads to finish.
+ */
+void gsi_calculate() {
+    gs_verbose_printf("\t****  Starting parallel Gauss-Seidel calculation ****\n");
+    
+    /* Create and launch worker threads */
+    for (int t = 0; t < gs_nthreads; t++) {
+        if (pthread_create(&threads[t].thread, NULL, thread_compute, &threads[t]) != 0) {
+            fprintf(stderr, "Error creating thread %d\n", t);
+            exit(EXIT_FAILURE);
+        }
+    }
+    
+    /* Wait for all threads to complete */
+    for (int t = 0; t < gs_nthreads; t++) {
+        pthread_join(threads[t].thread, NULL);
+    }
+    
+    /* Print convergence information */
+    if (converged) {
+        printf("Solution converged after %d iterations.\n", iterations_completed);
+    } else {
+        printf("Reached maximum number of iterations. Solution did NOT converge.\n");
+        printf("Note: This is normal if you are using the default settings.\n");
+    }
+    
+    gs_verbose_printf("\t****  Parallel Gauss-Seidel calculation completed ****\n");
+}
+```
+
+This is the main function that external code calls to start the calculation:
+
+- **Thread Creation**:
+  ```c
+  for (int t = 0; t < gs_nthreads; t++) {
+      if (pthread_create(&threads[t].thread, NULL, thread_compute, &threads[t]) != 0) {
+          fprintf(stderr, "Error creating thread %d\n", t);
+          exit(EXIT_FAILURE);
+      }
+  }
+  ```
+  - Creates `gs_nthreads` worker threads
+  - Each thread executes the `thread_compute` function
+  - Passes a pointer to the thread's info structure as an argument
+
+- **Thread Joining**:
+  ```c
+  for (int t = 0; t < gs_nthreads; t++) {
+      pthread_join(threads[t].thread, NULL);
+  }
+  ```
+  - Waits for each thread to complete
+  - The second NULL parameter means we're not interested in the thread's return value
+
+- **Result Reporting**:
+  ```c
+  if (converged) {
+      printf("Solution converged after %d iterations.\n", iterations_completed);
+  } else {
+      printf("Reached maximum number of iterations. Solution did NOT converge.\n");
+      printf("Note: This is normal if you are using the default settings.\n");
+  }
+  ```
+  - Reports whether the solution converged or not
+  - Provides information about the number of iterations
+
+## Key Insights from This Implementation
+
+1. **Work Division Strategy**: Vertical column-based division allows for efficient parallelization while maintaining the Gauss-Seidel dependency pattern.
+
+2. **Synchronization Approach**:
+   - Row-level synchronization using atomic counters
+   - Iteration-level synchronization using barriers
+   - This dual approach ensures correctness while minimizing overhead
+
+3. **Performance Optimizations**:
+   - Cache-aligned structures to prevent false sharing
+   - Lightweight spin-waiting with small delays
+   - Efficient work distribution with special handling for the last thread
+
+4. **Error Handling and Convergence**:
+   - Local error calculation in each thread
+   - Global error combination by a single thread
+   - Clear convergence criteria and reporting
+
+This implementation demonstrates a sophisticated understanding of parallel programming patterns, careful attention to performance details, and robust synchronization techniques to ensure correctness.
